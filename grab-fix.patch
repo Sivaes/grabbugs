@@ -1,0 +1,861 @@
+diff --git a/Extension/Console/commands.cpp b/Extension/Console/commands.cpp
+index b449231..72d1829 100644
+--- a/Extension/Console/commands.cpp
++++ b/Extension/Console/commands.cpp
+@@ -232,6 +232,7 @@ const Commands &game_commands() {
+         register_road_rash_commands(*result);
+         register_board_break_commands(*result);
+         register_grind_exit_commands(*result);
++        register_grab_fix_commands(*result);
+         register_replay_keyframes_commands(*result);
+         return result;
+     }();
+diff --git a/Extension/Console/commands.h b/Extension/Console/commands.h
+index 828ecd1..b25fe27 100644
+--- a/Extension/Console/commands.h
++++ b/Extension/Console/commands.h
+@@ -30,6 +30,7 @@ void register_hall_of_meat_commands(Commands &);
+ void register_road_rash_commands(Commands &);
+ void register_board_break_commands(Commands &);
+ void register_grind_exit_commands(Commands &);
++void register_grab_fix_commands(Commands &);
+ void register_replay_keyframes_commands(Commands &);
+ // Runtime adapters. Invoked only by the verified game-thread dispatcher.
+ void request_debug(overlay::DebugAction, bool enabled = false, float value = 0);
+diff --git a/Extension/Skater/grab_fix.cpp b/Extension/Skater/grab_fix.cpp
+new file mode 100644
+index 0000000..2ebec98
+--- /dev/null
++++ b/Extension/Skater/grab_fix.cpp
+@@ -0,0 +1,465 @@
++#include "grab_fix.h"
++#include "no_bail.h"
++#include "Engine/Core/Log/logging.h"
++#include "Engine/Core/Platform/memory.h"
++#include "Engine/Game/Build/addresses.h"
++#include "Engine/Game/Build/20260929/skater_state.h"
++#include "Extension/Settings/named_settings.h"
++#include "Extension/UI/Overlay/overlay.h"
++#include <Windows.h>
++#include <shlobj.h>
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <deque>
++#include <filesystem>
++#include <format>
++#include <fstream>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace dingosdk::grab_fix {
++namespace {
++namespace sstate = addr::skater_state;
++
++constexpr const char* legacy_setting = "DingoGameplay.UseLegacyFootPlants";
++constexpr std::uint64_t legacy_check_ms = 1000;
++// The probe's window of the skater context: the animation outputs the dark pop work read
++// (+0x13c4 jump, +0x13c8 landing stage, +0x13d0 graph signals, +0x13f8, +0x1414 physics state).
++constexpr std::uintptr_t context_first = 0x1380;
++constexpr std::size_t context_words = 48; // to +0x143c
++constexpr std::size_t trick_bytes = 0x200; // the core's trick state (core +0x3b8), from its start
++constexpr std::size_t pre_rows = 12, post_rows = 30;
++constexpr std::size_t queue_limit = 20000;
++// XInput button bits.
++constexpr std::uint16_t pad_a = 0x1000, pad_b = 0x2000, pad_x = 0x4000, pad_y = 0x8000, pad_lb = 0x0100, pad_rb = 0x0200;
++constexpr std::uint8_t trigger_down = 102; // of 255, as the grind exit control counts a press
++
++struct Pad {
++    overlay::GamepadValues values;
++    unsigned user{};
++    std::int64_t qpc{};
++};
++struct Row {
++    std::int64_t qpc{};
++    std::uint32_t seq{}, state{};
++    char phase{}; // 'p' before takeoff, 'a' in the air, 'l' after landing
++    float seconds{};
++    bool wipeout{};
++    Pad pad;
++    bool context_ok{}, board_ok{}, trick_ok{};
++    std::array<std::uint32_t, context_words> context{};
++    std::array<float, 3> board_velocity{}, board_spin{};
++    std::array<std::uint8_t, trick_bytes> trick{};
++};
++struct AirSummary {
++    std::uint32_t seq{}, steps{}, lt_steps{}, rt_steps{}, a_steps{}, x_steps{};
++    std::uint32_t first_state{}, last_state{}, after_state{};
++    float tweak_x_min{}, tweak_x_max{}, tweak_y_min{}, tweak_y_max{}; // right stick, -1..1
++    double seconds{};
++};
++
++struct GrabFix {
++    std::atomic<std::uintptr_t> base{};
++    std::atomic<bool> started{}, wanted{true}, probe_wanted{true}, probe_on{};
++    std::atomic<int> legacy{}; // 0 not found, 1 on, 2 off
++    std::filesystem::path settings_path;
++    // The legacy footplant setting (game update thread only).
++    std::atomic<std::uint64_t> next_legacy{}; // zeroed by the console to apply a change at once
++    std::uint64_t started_tick{};
++    bool legacy_applied{}, legacy_missing_logged{};
++    std::uint32_t legacy_writes{};
++    // The pad as the game read it (the game's input threads -> the physics thread).
++    SRWLOCK pad_lock = SRWLOCK_INIT;
++    Pad pad;
++    // Physics thread only.
++    std::deque<Row> pre;
++    bool recording{};
++    std::size_t post_left{};
++    std::uint32_t seq{};
++    AirSummary air;
++    bool air_open{};
++    // Physics thread -> client tick.
++    std::mutex queue_lock;
++    std::vector<Row> rows;
++    std::vector<AirSummary> airs;
++    std::atomic<std::uint64_t> dropped{};
++    // Client tick only.
++    std::ofstream csv;
++    bool csv_failed{};
++    std::int64_t csv_start{};
++    std::array<std::uint8_t, trick_bytes> last_trick{};
++    bool last_trick_ok{};
++};
++GrabFix& grab() {
++    static auto* value = new GrabFix; // process lifetime: hooks may call in until exit
++    return *value;
++}
++std::int64_t qpc_now() noexcept {
++    LARGE_INTEGER value{};
++    QueryPerformanceCounter(&value);
++    return value.QuadPart;
++}
++double qpc_seconds(std::int64_t ticks) noexcept {
++    static const double frequency = [] {
++        LARGE_INTEGER value{};
++        QueryPerformanceFrequency(&value);
++        return static_cast<double>(value.QuadPart);
++    }();
++    return static_cast<double>(ticks) / frequency;
++}
++bool air_state(std::uint32_t state) noexcept {
++    // The board air states, and the 600s (board placement / footplants out of the air).
++    return state == sstate::board_air_states[0] || state == sstate::board_air_states[1] || (state >= 600 && state < 700);
++}
++float stick(std::int16_t value) noexcept { return static_cast<float>(value) / 32767.0f; }
++
++// ---- settings ------------------------------------------------------------------------------
++std::filesystem::path settings_file() {
++    PWSTR raw{};
++    std::filesystem::path result;
++    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &raw)) && raw)
++        result = std::filesystem::path(raw) / L"ReSkate" / L"grabfix" / L"settings.txt";
++    if (raw) CoTaskMemFree(raw);
++    return result;
++}
++void load_settings(GrabFix& g) {
++    if (g.settings_path.empty()) return;
++    std::ifstream in(g.settings_path);
++    std::string line;
++    while (std::getline(in, line)) {
++        if (!line.empty() && line.back() == '\r') line.pop_back();
++        if (line == "enabled=1") g.wanted.store(true);
++        else if (line == "enabled=0") g.wanted.store(false);
++        else if (line == "probe=1") g.probe_wanted.store(true);
++        else if (line == "probe=0") g.probe_wanted.store(false);
++    }
++}
++void save_settings(GrabFix& g) {
++    if (g.settings_path.empty()) return;
++    std::error_code error;
++    std::filesystem::create_directories(g.settings_path.parent_path(), error);
++    std::ofstream out(g.settings_path, std::ios::trunc);
++    out << "enabled=" << (g.wanted.load() ? 1 : 0) << "\n";
++    out << "probe=" << (g.probe_wanted.load() ? 1 : 0) << "\n";
++}
++
++// ---- input side ----------------------------------------------------------------------------
++// Any thread the game polls its pad from: what the game read, after any filter.
++void observe_pad(unsigned user, overlay::GamepadValues& pad) noexcept {
++    auto& g = grab();
++    const auto now = qpc_now();
++    AcquireSRWLockExclusive(&g.pad_lock);
++    g.pad.values = pad;
++    g.pad.user = user;
++    g.pad.qpc = now;
++    ReleaseSRWLockExclusive(&g.pad_lock);
++}
++
++// ---- physics side --------------------------------------------------------------------------
++bool board_body(const NoBailSkater& skater, std::array<float, 3>& velocity, std::array<float, 3>& spin) noexcept {
++    std::uintptr_t holder{}, physics{}, type{}, bodies{}, owner{};
++    std::uint32_t count{};
++    if (!memory::peek(skater.core + sstate::board_holder_offset, holder) ||
++        !memory::peek(holder + sstate::board_physics_offset, physics) || !memory::peek(physics, type) ||
++        type != skater.base + sstate::board_physics_vtable || !memory::peek(physics + sstate::physics_bodies_offset, bodies) ||
++        !memory::peek(bodies, count) || count != sstate::board_body_count)
++        return false;
++    const auto body = bodies + sstate::board_root_body * sstate::physics_body_size;
++    if (!memory::peek(body + sstate::body_owner_offset, owner) || owner != physics ||
++        !memory::peek(body + sstate::body_velocity_offset, velocity) || !memory::peek(body + sstate::body_spin_offset, spin))
++        return false;
++    const auto sane = [](float v) { return std::isfinite(v) && std::abs(v) < 1000; };
++    return std::all_of(velocity.begin(), velocity.end(), sane) && std::all_of(spin.begin(), spin.end(), sane);
++}
++void tally(AirSummary& a, const Row& row) noexcept {
++    const auto& p = row.pad.values;
++    ++a.steps;
++    a.seconds += row.seconds;
++    a.last_state = row.state;
++    if (p.left_trigger >= trigger_down) ++a.lt_steps;
++    if (p.right_trigger >= trigger_down) ++a.rt_steps;
++    if (p.buttons & pad_a) ++a.a_steps;
++    if (p.buttons & pad_x) ++a.x_steps;
++    const float rx = stick(p.right_x), ry = stick(p.right_y);
++    a.tweak_x_min = std::min(a.tweak_x_min, rx);
++    a.tweak_x_max = std::max(a.tweak_x_max, rx);
++    a.tweak_y_min = std::min(a.tweak_y_min, ry);
++    a.tweak_y_max = std::max(a.tweak_y_max, ry);
++}
++void push(GrabFix& g, const Row& row) {
++    std::lock_guard lock(g.queue_lock);
++    if (g.rows.size() >= queue_limit) {
++        g.dropped.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    g.rows.push_back(row);
++}
++// Physics thread, every step of the local skater.
++void on_step(const NoBailSkater& skater, float seconds, bool wipeout) noexcept {
++    auto& g = grab();
++    if (!g.probe_on.load(std::memory_order_acquire)) return;
++    try {
++        Row row;
++        row.qpc = qpc_now();
++        row.seconds = seconds;
++        row.wipeout = wipeout;
++        if (!memory::peek(skater.context + sstate::physics_state_offset, row.state)) return;
++        AcquireSRWLockShared(&g.pad_lock);
++        row.pad = g.pad;
++        ReleaseSRWLockShared(&g.pad_lock);
++        row.context_ok = memory::peek(skater.context + context_first, row.context);
++        row.board_ok = board_body(skater, row.board_velocity, row.board_spin);
++        std::uintptr_t trick{};
++        row.trick_ok = memory::peek(skater.core + sstate::trick_state_offset, trick) && trick >= 0x10000 &&
++                       trick < memory::highest_user_address - trick_bytes && memory::peek(trick, row.trick);
++        const bool air = air_state(row.state);
++        if (air && !g.recording) {
++            // Takeoff: a new air, with the steps just before it.
++            g.recording = true;
++            g.post_left = post_rows;
++            row.seq = ++g.seq;
++            for (auto& before : g.pre) {
++                before.seq = row.seq;
++                before.phase = 'p';
++                push(g, before);
++            }
++            g.pre.clear();
++            g.air = {};
++            g.air.seq = row.seq;
++            g.air.first_state = row.state;
++            g.air_open = true;
++        }
++        if (g.recording) {
++            row.seq = g.seq;
++            if (air) {
++                row.phase = 'a';
++                g.post_left = post_rows; // back in the air (a footplant into 201): the air goes on
++                tally(g.air, row);
++            } else {
++                row.phase = 'l';
++                if (g.air_open) {
++                    g.air.after_state = row.state;
++                    g.air_open = false;
++                    std::lock_guard lock(g.queue_lock);
++                    if (g.airs.size() < 256) g.airs.push_back(g.air);
++                }
++                if (g.post_left) --g.post_left;
++                if (!g.post_left) g.recording = false;
++            }
++            push(g, row);
++        } else {
++            row.phase = 'p';
++            g.pre.push_back(row);
++            while (g.pre.size() > pre_rows) g.pre.pop_front();
++        }
++    } catch (...) {
++    }
++}
++
++// ---- client side ---------------------------------------------------------------------------
++void open_csv(GrabFix& g) {
++    if (g.csv.is_open() || g.csv_failed) return;
++    try {
++        auto directory = logging::status().directory;
++        if (directory.empty()) {
++            g.csv_failed = true;
++            logging::write(logging::Level::warning, logging::Channel::skater, "Grab probe: no log folder; nothing will be recorded.");
++            return;
++        }
++        SYSTEMTIME time;
++        GetLocalTime(&time);
++        const auto file = directory / std::format("grab-probe-{:04}{:02}{:02}-{:02}{:02}{:02}.csv", time.wYear, time.wMonth, time.wDay,
++                                                  time.wHour, time.wMinute, time.wSecond);
++        g.csv.open(file, std::ios::binary | std::ios::trunc);
++        if (!g.csv) {
++            g.csv_failed = true;
++            logging::log(logging::Level::warning, logging::Channel::skater, "Grab probe: could not write {}.", file.string());
++            return;
++        }
++        g.csv << "t,seq,phase,state,step_ms,wipeout,pad_age_ms,pad_user,buttons,A,B,X,Y,LB,RB,LT,RT,LX,LY,RX,RY,"
++                 "board_vx,board_vy,board_vz,board_spin_x,board_spin_y,board_spin_z,ctx_1380_to_143c,trick_state\n";
++        g.csv_start = qpc_now();
++        logging::log(logging::Level::info, logging::Channel::skater, "Grab probe: recording to {}.", file.string());
++    } catch (...) {
++        g.csv_failed = true;
++    }
++}
++void write_row(GrabFix& g, const Row& r) {
++    const auto& p = r.pad.values;
++    const double age = r.pad.qpc ? qpc_seconds(r.qpc - r.pad.qpc) * 1000.0 : -1.0;
++    std::string line = std::format("{:.4f},{},{},{},{:.2f},{},{:.1f},{},{:04x},{},{},{},{},{},{},{},{},{},{},{},{}", qpc_seconds(r.qpc - g.csv_start), r.seq,
++                                   r.phase, r.state, r.seconds * 1000.0f, r.wipeout ? 1 : 0, age, r.pad.user, p.buttons,
++                                   (p.buttons & pad_a) ? 1 : 0, (p.buttons & pad_b) ? 1 : 0, (p.buttons & pad_x) ? 1 : 0,
++                                   (p.buttons & pad_y) ? 1 : 0, (p.buttons & pad_lb) ? 1 : 0, (p.buttons & pad_rb) ? 1 : 0,
++                                   p.left_trigger, p.right_trigger, p.left_x, p.left_y, p.right_x, p.right_y);
++    if (r.board_ok)
++        line += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}", r.board_velocity[0], r.board_velocity[1], r.board_velocity[2],
++                            r.board_spin[0], r.board_spin[1], r.board_spin[2]);
++    else
++        line += ",,,,,,";
++    line += ',';
++    if (r.context_ok)
++        for (std::size_t i = 0; i < context_words; ++i) line += std::format("{}{:08x}", i ? " " : "", r.context[i]);
++    line += ',';
++    // The trick state only when it changed since the row before (an empty cell: the same).
++    if (r.trick_ok && (!g.last_trick_ok || r.trick != g.last_trick)) {
++        for (const auto byte : r.trick) line += std::format("{:02x}", byte);
++        g.last_trick = r.trick;
++    }
++    g.last_trick_ok = r.trick_ok;
++    line += '\n';
++    g.csv << line;
++}
++void log_air(const AirSummary& a) {
++    logging::log(logging::Level::info, logging::Channel::skater,
++                 "Grab probe: air {} ({:.2f} s, state {} -> {}, landed into {}): LT {} step(s), RT {}, A {}, X {}; right stick x {:+.2f}..{:+.2f}, "
++                 "y {:+.2f}..{:+.2f}.",
++                 a.seq, a.seconds, a.first_state, a.last_state, a.after_state, a.lt_steps, a.rt_steps, a.a_steps, a.x_steps, a.tweak_x_min,
++                 a.tweak_x_max, a.tweak_y_min, a.tweak_y_max);
++}
++void flush_probe(GrabFix& g) {
++    std::vector<Row> rows;
++    std::vector<AirSummary> airs;
++    {
++        std::lock_guard lock(g.queue_lock);
++        rows.swap(g.rows);
++        airs.swap(g.airs);
++    }
++    if (!rows.empty()) {
++        open_csv(g);
++        if (g.csv.is_open()) {
++            for (const auto& row : rows) write_row(g, row);
++            g.csv.flush();
++        }
++    }
++    for (const auto& a : airs) log_air(a);
++    if (const auto dropped = g.dropped.exchange(0, std::memory_order_relaxed))
++        logging::log(logging::Level::warning, logging::Channel::skater, "Grab probe: {} row(s) dropped (the queue was full).", dropped);
++}
++bool set_probe(GrabFix& g, bool on) {
++    if (on == g.probe_on.load(std::memory_order_acquire)) return true;
++    if (on) {
++        if (!no_bail_available() || !add_no_bail_step_listener(&on_step)) return false;
++        DingoSDKOverlaySetGamepadObserver(&observe_pad);
++        g.probe_on.store(true, std::memory_order_release);
++        logging::write(logging::Level::info, logging::Channel::skater, "Grab probe on.");
++    } else {
++        g.probe_on.store(false, std::memory_order_release);
++        remove_no_bail_step_listener(&on_step);
++        DingoSDKOverlaySetGamepadObserver(nullptr);
++        logging::write(logging::Level::info, logging::Channel::skater, "Grab probe off.");
++    }
++    return true;
++}
++// Game update thread: the legacy footplant setting follows the on/off choice.
++void keep_legacy(GrabFix& g) {
++    const auto now = GetTickCount64();
++    if (now < g.next_legacy.load(std::memory_order_acquire)) return;
++    g.next_legacy.store(now + legacy_check_ms, std::memory_order_release);
++    const auto value = named_setting_value(legacy_setting);
++    if (!value) {
++        g.legacy.store(0, std::memory_order_release);
++        if (!g.legacy_missing_logged && now - g.started_tick > 60000) {
++            g.legacy_missing_logged = true;
++            logging::log(logging::Level::warning, logging::Channel::skater,
++                         "Grab Fix: the game has not registered {} after a minute; Sticky Grab is not fixed this session.", legacy_setting);
++        }
++        return;
++    }
++    const bool on = *value == "1";
++    if (g.wanted.load(std::memory_order_acquire)) {
++        if (!on) {
++            const auto result = change_named_setting(legacy_setting, "1", false);
++            const bool failed = result.starts_with("error");
++            ++g.legacy_writes;
++            // The first write, and then every tenth: something keeps setting it back (a session's host, the console).
++            if (g.legacy_writes == 1 || g.legacy_writes % 10 == 0 || failed)
++                logging::log(failed ? logging::Level::warning : logging::Level::info, logging::Channel::skater,
++                             "Grab Fix: legacy footplants on (write {}): {}", g.legacy_writes, result);
++            if (!failed) g.legacy_applied = true;
++            g.legacy.store(failed ? 2 : 1, std::memory_order_release);
++            return;
++        }
++        g.legacy.store(1, std::memory_order_release);
++        return;
++    }
++    if (g.legacy_applied) {
++        const auto result = change_named_setting(legacy_setting, {}, true);
++        g.legacy_applied = false;
++        g.legacy_writes = 0;
++        logging::log(logging::Level::info, logging::Channel::skater, "Grab Fix off: legacy footplants given back to the game ({}).", result);
++        g.next_legacy.store(0, std::memory_order_release);
++        return;
++    }
++    g.legacy.store(on ? 1 : 2, std::memory_order_release);
++}
++std::string status_text(GrabFix& g) {
++    if (!g.started.load(std::memory_order_acquire)) return "Grab Fix is unavailable.";
++    const int legacy = g.legacy.load();
++    return std::format("Grab Fix {}: Sticky Grab fix (legacy footplants) {}{}. Grab probe {}{}.", "0.1.0",
++                       g.wanted.load() ? "ON" : "off",
++                       legacy == 1 ? ", the setting is on" : legacy == 2 ? ", the setting is off" : ", waiting for the game's setting",
++                       g.probe_on.load() ? "ON" : "off",
++                       g.probe_on.load() ? " (logs\\grab-probe-*.csv)" : no_bail_available() ? "" : " (unavailable: No Bail's hooks did not start)");
++}
++} // namespace
++
++bool available() noexcept { return grab().started.load(std::memory_order_acquire); }
++bool enabled() noexcept { return grab().wanted.load(std::memory_order_acquire); }
++bool probe_available() noexcept { return available() && no_bail_available(); }
++bool probe() noexcept { return grab().probe_on.load(std::memory_order_acquire); }
++int legacy_footplants() noexcept { return grab().legacy.load(std::memory_order_acquire); }
++
++bool start(std::uintptr_t image_base) noexcept {
++    auto& g = grab();
++    if (g.started.load(std::memory_order_acquire)) return true;
++    try {
++        g.settings_path = settings_file();
++        load_settings(g);
++    } catch (...) {}
++    g.base.store(image_base, std::memory_order_release);
++    g.started_tick = GetTickCount64();
++    g.started.store(true, std::memory_order_release);
++    logging::log(logging::Level::info, logging::Channel::skater, "Grab Fix 0.1.0 started: Sticky Grab fix {}, grab probe {}.",
++                 g.wanted.load() ? "on" : "off", g.probe_wanted.load() ? "on" : "off");
++    if (g.probe_wanted.load() && !set_probe(g, true))
++        logging::write(logging::Level::warning, logging::Channel::skater,
++                       "Grab probe could not start: it follows the skater's physics steps through No Bail's hooks (not started, or no free step listener).");
++    return true;
++}
++
++void on_client_tick(std::uintptr_t) noexcept {
++    auto& g = grab();
++    if (!g.started.load(std::memory_order_acquire)) return;
++    try {
++        keep_legacy(g);
++        flush_probe(g);
++    } catch (...) {}
++}
++
++std::string command(const std::vector<std::string>& words) {
++    auto& g = grab();
++    const auto verb = words.empty() ? std::string("status") : words[0];
++    const auto arg = words.size() > 1 ? words[1] : std::string{};
++    if (verb == "status" || verb.empty()) return status_text(g);
++    if (!g.started.load()) return status_text(g);
++    if (verb == "on" || verb == "off") {
++        g.wanted.store(verb == "on");
++        g.next_legacy.store(0, std::memory_order_release); // the next tick applies it
++        try { save_settings(g); } catch (...) {}
++        return status_text(g);
++    }
++    if (verb == "probe") {
++        if (arg != "on" && arg != "off") return "Usage: grabfix probe on|off";
++        const bool on = arg == "on";
++        if (!set_probe(g, on)) return "The grab probe could not start: No Bail's hooks did not start, or no step listener is free.";
++        g.probe_wanted.store(on);
++        try { save_settings(g); } catch (...) {}
++        return status_text(g);
++    }
++    return "Usage: grabfix on|off|status, grabfix probe on|off";
++}
++} // namespace dingosdk::grab_fix
+diff --git a/Extension/Skater/grab_fix.h b/Extension/Skater/grab_fix.h
+new file mode 100644
+index 0000000..d41c892
+--- /dev/null
++++ b/Extension/Skater/grab_fix.h
+@@ -0,0 +1,44 @@
++#pragma once
++#include <cstdint>
++#include <string>
++#include <vector>
++
++// Grab Fix: the two grab bugs skate. picked up after Season 2.
++//
++//   Sticky Grab (A/X modified grabs: benihana, dog piss, judo nose, one foot tail): the game
++//     misses their release and holds the grab until landing. The game still has its old footplant
++//     path behind the engine setting DingoGameplay.UseLegacyFootPlants (added after Season 2, off
++//     by default); with it on the release registers again (tested 19 Oct 2026). While Grab Fix is
++//     on, that setting is turned on on every launch and kept on, offline and in sessions. Turned
++//     off, Grab Fix gives the setting back to the game's value.
++//
++//   Grab Swap (tweak the board to the nose or tail, press a trigger, get a frontside/backside grab
++//     instead): not fixed yet. The legacy footplants make it rarer, not gone. The grab probe
++//     records what the game is given and what it does on every physics step in the air, so the
++//     decision can be found:
++//       %game%\logs\grab-probe-<date>-<time>.csv, next to ReSkate.log, one file per launch. A row
++//       per physics step from 12 steps before the skater leaves the ground to 30 steps after it
++//       comes back: the pad as the GAME read it (after any other ReSkate filter), the physics
++//       state, the board's root velocity and spin, a window of the skater context's words, and the
++//       core's trick-state block whenever it changed since the row before.
++//     One line per air goes to ReSkate.log (what was pressed, how long).
++//
++// On/off and the probe are kept in %LOCALAPPDATA%\ReSkate\grabfix\settings.txt. Console:
++// grabfix on|off|probe on|off|status.
++namespace dingosdk::grab_fix {
++// Once, at runtime start, after No Bail (the probe follows the skater's physics steps through its
++// hooks; the legacy footplant setting does not need them).
++bool start(std::uintptr_t image_base) noexcept;
++// The client tick, on the game update thread (the thread that owns the engine settings).
++void on_client_tick(std::uintptr_t client) noexcept;
++// The console verbs.
++std::string command(const std::vector<std::string>& words);
++
++// For the menus, any thread.
++bool available() noexcept;
++bool enabled() noexcept;
++bool probe_available() noexcept;
++bool probe() noexcept;
++// The legacy footplant setting as last read: 0 not found yet, 1 on, 2 off.
++int legacy_footplants() noexcept;
++}
+diff --git a/Extension/Skater/grab_fix_commands.cpp b/Extension/Skater/grab_fix_commands.cpp
+new file mode 100644
+index 0000000..3a46b84
+--- /dev/null
++++ b/Extension/Skater/grab_fix_commands.cpp
+@@ -0,0 +1,43 @@
++#include "grab_fix.h"
++#include "Extension/Console/commands.h"
++
++// Grab Fix's console verbs (grab_fix.h).
++namespace dingosdk::console {
++void register_grab_fix_commands(Commands &registry) {
++    struct Verb {
++        const char *name;
++        const char *description;
++        const char *usage;
++    };
++    const Verb verbs[]{
++        {"on", "Grab Fix: the Sticky Grab fix, the game's legacy footplants kept on (kept)", nullptr},
++        {"off", "Grab Fix: give the legacy footplant setting back to the game (kept)", nullptr},
++        {"status", "Grab Fix: what is on, and the game's legacy footplant setting", nullptr},
++        {"probe", "Grab Fix: record every air to logs\\grab-probe-*.csv (kept)", "on|off"},
++    };
++    for (const auto &verb : verbs) {
++        std::vector<Argument> arguments;
++        if (verb.usage) {
++            auto rest = argument(verb.usage, Type::text, true);
++            rest.rest = true;
++            arguments.push_back(std::move(rest));
++        }
++        auto entry = action(std::string("grabfix ") + verb.name, verb.description, Group::gameplay, std::move(arguments));
++        entry.run = [name = std::string(verb.name)](const Model &, const Values &values, const Output &out) {
++            std::vector<std::string> words{name};
++            if (!values.empty())
++                if (const auto *text = std::get_if<std::string>(&values[0])) {
++                    std::size_t start = 0;
++                    while (start < text->size()) {
++                        auto end = text->find(' ', start);
++                        if (end == std::string::npos) end = text->size();
++                        if (end > start) words.push_back(text->substr(start, end - start));
++                        start = end + 1;
++                    }
++                }
++            out(grab_fix::command(words));
++        };
++        registry.add(std::move(entry));
++    }
++}
++} // namespace dingosdk::console
+diff --git a/Extension/UI/Overlay/input_capture.cpp b/Extension/UI/Overlay/input_capture.cpp
+index 6a19a26..c05a8cc 100644
+--- a/Extension/UI/Overlay/input_capture.cpp
++++ b/Extension/UI/Overlay/input_capture.cpp
+@@ -81,6 +81,12 @@ std::atomic<dingosdk::overlay::GamepadFilter>& gamepad_filter() {
+     static std::atomic<dingosdk::overlay::GamepadFilter> value{};
+     return value;
+ }
++// A read-only watcher of the same reads (DingoSDKOverlaySetGamepadObserver): it is handed what the
++// game reads, after the filter, and whatever it changes is discarded. Grab Fix's probe.
++std::atomic<dingosdk::overlay::GamepadFilter>& gamepad_observer() {
++    static std::atomic<dingosdk::overlay::GamepadFilter> value{};
++    return value;
++}
+ // Full Bluetooth reports have a CRC over the 0xA1 input prefix and payload.
+ // A stale checksum makes the native reader discard a changed report.
+ void refresh_bluetooth_crc(std::uint8_t* bytes, DWORD size) noexcept {
+@@ -132,7 +138,8 @@ void neutral_hid(const InputCaptureHooks::HidRead& read, DWORD size) {
+ inline constexpr unsigned hid_filter_slot = 3; // the filter's pad slot for native PlayStation pads
+ void filter_hid(const InputCaptureHooks::HidRead& read, DWORD size) noexcept {
+     const auto filter = gamepad_filter().load(std::memory_order_acquire);
+-    if (!filter || !read.buffer || !size || size > read.capacity) return;
++    const auto observer = gamepad_observer().load(std::memory_order_acquire);
++    if ((!filter && !observer) || !read.buffer || !size || size > read.capacity) return;
+     auto* bytes = static_cast<std::uint8_t*>(read.buffer);
+     const bool bluetooth = playstation_bluetooth(size);
+     const auto parsed = parse_playstation_report(read.kind, bluetooth, bytes, size);
+@@ -140,7 +147,12 @@ void filter_hid(const InputCaptureHooks::HidRead& read, DWORD size) noexcept {
+     const dingosdk::overlay::GamepadValues before{parsed->buttons, parsed->left_trigger, parsed->right_trigger,
+         parsed->left_x, parsed->left_y, parsed->right_x, parsed->right_y};
+     auto pad = before;
+-    filter(hid_filter_slot, pad);
++    if (filter) filter(hid_filter_slot, pad);
++    if (observer) {
++        auto seen = pad; // what the game is left with; the observer's changes are not kept
++        observer(hid_filter_slot, seen);
++    }
++    if (!filter) return;
+     if (pad.left_trigger == before.left_trigger && pad.right_trigger == before.right_trigger && pad.left_x == before.left_x) return;
+     // Where parse_playstation_report found them: sticks (left X first), the shoulder byte (L2 0x04,
+     // R2 0x08 digital bits) and the two analog triggers.
+@@ -326,10 +338,16 @@ std::string xinput_entry_owners() {
+ void filter_pad(bool outer, DWORD user, XINPUT_STATE* output) noexcept {
+     if (!outer || !output) return;
+     const auto filter = gamepad_filter().load(std::memory_order_acquire);
+-    if (!filter) return;
++    const auto observer = gamepad_observer().load(std::memory_order_acquire);
++    if (!filter && !observer) return;
+     auto& g = output->Gamepad;
+     dingosdk::overlay::GamepadValues pad{g.wButtons, g.bLeftTrigger, g.bRightTrigger, g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY};
+-    filter(static_cast<unsigned>(user), pad);
++    if (filter) filter(static_cast<unsigned>(user), pad);
++    if (observer) {
++        auto seen = pad; // what the game is left with; the observer's changes are not kept
++        observer(static_cast<unsigned>(user), seen);
++    }
++    if (!filter) return;
+     g.wButtons = pad.buttons;
+     g.bLeftTrigger = pad.left_trigger;
+     g.bRightTrigger = pad.right_trigger;
+@@ -958,3 +976,6 @@ bool install_input_capture() {
+ extern "C" void DingoSDKOverlaySetGamepadFilter(dingosdk::overlay::GamepadFilter filter) {
+     dingosdk::overlay::detail::gamepad_filter().store(filter, std::memory_order_release);
+ }
++extern "C" void DingoSDKOverlaySetGamepadObserver(dingosdk::overlay::GamepadFilter observer) {
++    dingosdk::overlay::detail::gamepad_observer().store(observer, std::memory_order_release);
++}
+diff --git a/Extension/UI/Overlay/overlay.h b/Extension/UI/Overlay/overlay.h
+index 56cfe68..96c49bb 100644
+--- a/Extension/UI/Overlay/overlay.h
++++ b/Extension/UI/Overlay/overlay.h
+@@ -254,6 +254,14 @@ struct GrindExitModel {
+     int strength = 100; // pop-out strength, percent (10-100)
+ };
+ 
++// Grab Fix (Extension/Skater/grab_fix.h): started, the Sticky Grab fix switched on, the probe
++// startable and recording, and the game's legacy footplant setting as last read (0 not found
++// yet, 1 on, 2 off).
++struct GrabFixModel {
++    bool available = false, enabled = false, probe_available = false, probe = false;
++    int legacy = 0;
++};
++
+ // Keyframe smoothing (Extension/ReplayKeyframes/replay_keyframes.h): started, switched on, and how
+ // smooth (0..1) when on.
+ struct KeyframeSmoothingModel {
+@@ -285,6 +293,7 @@ struct Model {
+     RoadRashModel road_rash;
+     BoardBreakModel board_break;
+     GrindExitModel grind_exit;
++    GrabFixModel grab_fix;
+     KeyframeSmoothingModel keyframe_smoothing;
+     ObjectPersistenceModel object_persistence;
+     ParkEditorModel editor;
+@@ -622,6 +631,9 @@ extern "C" unsigned DingoSDKOverlayReadPromptKeys();
+ extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* input, bool allow_menu = false);
+ // Installs (or, with nullptr, removes) the one gamepad filter. Any thread.
+ extern "C" void DingoSDKOverlaySetGamepadFilter(dingosdk::overlay::GamepadFilter filter);
++// Installs (or, with nullptr, removes) the one gamepad observer: handed every read the filter
++// sees, after the filter, read-only (its changes are discarded). Any thread. Grab Fix's probe.
++extern "C" void DingoSDKOverlaySetGamepadObserver(dingosdk::overlay::GamepadFilter observer);
+ 
+ // Optional direct integration for a host that already knows its exact pair.
+ struct IDXGISwapChain;
+diff --git a/Extension/UI/Overlay/skate_menu.cpp b/Extension/UI/Overlay/skate_menu.cpp
+index 526b74d..b843da9 100644
+--- a/Extension/UI/Overlay/skate_menu.cpp
++++ b/Extension/UI/Overlay/skate_menu.cpp
+@@ -817,10 +817,10 @@ constexpr std::array<const char*, page_count> page_subtitles{
+     "Everything, a button away.", "Pick your spot. Set the vibe.", "Make the park yours.", "Ride it your way.",
+     "Tune it. Drill it.", "What ReSkate adds to skate.", "Bring your crew.", "Pick up where you want.",
+     "Bring your own.", "Your controls, your screen.", "Under the hood."};
+-constexpr std::array<const char*, addon_count> addon_names{"ADDONS", "DRONE", "BOARD BREAK", "ROAD RASH", "HALL OF MEAT", "GRIND EXITS", "MUSIC"};
++constexpr std::array<const char*, addon_count> addon_names{"ADDONS", "DRONE", "BOARD BREAK", "ROAD RASH", "HALL OF MEAT", "GRIND EXITS", "GRAB FIX", "MUSIC"};
+ constexpr std::array<const char*, addon_count> addon_subtitles{
+     "What ReSkate adds to skate.", "Take it to the sky.", "Slams snap your board.", "Bails leave their mark.", "Every bone counts.", "Pick the side you pop out.",
+-    "Your sound, in the game."};
++    "Grabs let go when you do.", "Your sound, in the game."};
+ // The side rail's groups: the heading above the page that starts each.
+ const char* group_of(int page) {
+     switch (page) {
+diff --git a/Extension/UI/Overlay/skate_menu_addons.cpp b/Extension/UI/Overlay/skate_menu_addons.cpp
+index 1333148..fef9860 100644
+--- a/Extension/UI/Overlay/skate_menu_addons.cpp
++++ b/Extension/UI/Overlay/skate_menu_addons.cpp
+@@ -83,6 +83,10 @@ void all_addons(SkateMenu& menu, const Model& model) {
+     next();
+     addon_tile(menu, "addon-grind-exits", "GRIND EXITS", "Press LT or RT while grinding to pick the side you pop out to.",
+                on_off(grind.available, grind.enabled), colour(grind.available, grind.enabled), addon_grind_exits);
++    const auto& grab = model.grab_fix;
++    next();
++    addon_tile(menu, "addon-grab-fix", "GRAB FIX", "A and X grabs let go when you let go again (the game's legacy footplants).",
++               on_off(grab.available, grab.enabled), colour(grab.available, grab.enabled), addon_grab_fix);
+     next();
+     addon_tile(menu, "addon-music", "MUSIC", "Spotify, YouTube Music, your own files and online radio through the game's music player.",
+                nullptr, 0, addon_music);
+@@ -100,7 +104,7 @@ void addons_page(SkateMenu& menu, const Model& model, const CallbacksV3& callbac
+     // (LT / RT on a controller), without the hidden ones.
+     if (menu.fullscreen_drawn) {
+         static constexpr std::array<const char*, addon_count> names{"ALL ADDONS", "DRONE", "BOARD BREAK", "ROAD RASH", "HALL OF MEAT",
+-                                                                    "GRIND EXITS", "MUSIC"};
++                                                                    "GRIND EXITS", "GRAB FIX", "MUSIC"};
+         std::vector<const char*> labels;
+         std::vector<int> shown;
+         for (int a = 0; a < addon_count; ++a)
+@@ -119,6 +123,7 @@ void addons_page(SkateMenu& menu, const Model& model, const CallbacksV3& callbac
+         else if (menu.addon == addon_road_rash) road_rash_addon(menu, model, callbacks);
+         else if (menu.addon == addon_hall_of_meat) hall_of_meat_addon(menu, model, callbacks);
+         else if (menu.addon == addon_grind_exits) grind_exits_addon(menu, model, callbacks);
++        else if (menu.addon == addon_grab_fix) grab_fix_addon(menu, model, callbacks);
+         else all_addons(menu, model);
+         ImGui::EndChild();
+         break;
+diff --git a/Extension/UI/Overlay/skate_menu_internal.h b/Extension/UI/Overlay/skate_menu_internal.h
+index 7659107..2e0f59f 100644
+--- a/Extension/UI/Overlay/skate_menu_internal.h
++++ b/Extension/UI/Overlay/skate_menu_internal.h
+@@ -126,6 +126,7 @@ void board_break_addon(SkateMenu&, const Model&, const CallbacksV3&);
+ void road_rash_addon(SkateMenu&, const Model&, const CallbacksV3&);
+ void hall_of_meat_addon(SkateMenu&, const Model&, const CallbacksV3&);
+ void grind_exits_addon(SkateMenu&, const Model&, const CallbacksV3&);
++void grab_fix_addon(SkateMenu&, const Model&, const CallbacksV3&);
+ void addons_page(SkateMenu&, const Model&, const CallbacksV3&);
+ // The time of day the menu shows: the one last asked for while the game is still changing to it
+ // (skate_menu_world.cpp). Setting it from a menu control goes through set_time_of_day, `quiet`
+@@ -145,7 +146,7 @@ enum Page {
+     page_home, page_map, page_build, page_skater, page_sandbox, page_addons, page_online, page_progress, page_mods,
+     page_settings, page_developer, page_count
+ };
+-enum Addon { addon_all, addon_drone, addon_board_break, addon_road_rash, addon_hall_of_meat, addon_grind_exits, addon_music, addon_count };
++enum Addon { addon_all, addon_drone, addon_board_break, addon_road_rash, addon_hall_of_meat, addon_grind_exits, addon_grab_fix, addon_music, addon_count };
+ void open_page(SkateMenu&, int page, int addon = -1);
+ // An addon made from an official mod whose feature did not start (the mod is turned off in the
+ // launcher, or this game build cannot run it) is listed nowhere in the menu (skate_menu_addons.cpp).
+diff --git a/Extension/UI/Overlay/skate_menu_skater.cpp b/Extension/UI/Overlay/skate_menu_skater.cpp
+index d9d09cf..aede1ea 100644
+--- a/Extension/UI/Overlay/skate_menu_skater.cpp
++++ b/Extension/UI/Overlay/skate_menu_skater.cpp
+@@ -350,6 +350,25 @@ void grind_exits_addon(SkateMenu& menu, const Model& model, const CallbacksV3& c
+     end_card();
+ }
+ 
++// Addons > GRAB FIX: Grab Fix (Extension/Skater/grab_fix.h). One toggle; the probe sits under it.
++void grab_fix_addon(SkateMenu& menu, const Model& model, const CallbacksV3& callbacks) {
++    const auto& grab = model.grab_fix;
++    const bool grab_console = grab.available && callbacks.queue_console_command;
++    begin_card(menu, "grab-fix", "GRAB FIX", "Fixes for the grab bugs skate. picked up after Season 2");
++    bool grab_on = grab.enabled;
++    if (toggle_row(menu, "Grab Fix", "Sticky Grab: benihana, dog piss, judo and one foot tail let go when you let go. Turns the game's "
++            "legacy footplants on and keeps them on.", grab_on, grab_console))
++        send_console(menu, callbacks, grab_on ? "grabfix on" : "grabfix off");
++    if (grab.enabled && grab.legacy == 0) note("Waiting for the game's footplant setting...");
++    else if (grab.enabled && grab.legacy == 2) warn("The game's legacy footplant setting is off; see ReSkate.log.");
++    bool probe_on = grab.probe;
++    if (toggle_row(menu, "Grab probe", "Records every air to logs\\grab-probe-*.csv next to ReSkate.log, for fixing Grab Swap. "
++            "Send that file with ReSkate.log after a test.", probe_on, grab_console && grab.probe_available))
++        send_console(menu, callbacks, probe_on ? "grabfix probe on" : "grabfix probe off");
++    if (!grab.probe_available) warn("The probe needs No Bail's hooks, which did not start for this game build.");
++    end_card();
++}
++
+ void skater_page(SkateMenu& menu, const Model& model, const CallbacksV3& callbacks) {
+     // (Grind exits are an addon: Addons > Grind Exits.)
+     category_tabs(menu, menu.skater_tab, {"FREECAM", "FIRST PERSON", "CHEATS"}, "skater-tabs");
+diff --git a/Runtime/client_tick.cpp b/Runtime/client_tick.cpp
+index 7f74641..dca54a4 100644
+--- a/Runtime/client_tick.cpp
++++ b/Runtime/client_tick.cpp
+@@ -21,6 +21,7 @@
+ #include "Extension/BoardBreak/board_break_audio.h"
+ #include "Extension/ReplayKeyframes/replay_keyframes.h"
+ #include "Extension/Skater/grind_exit_control.h"
++#include "Extension/Skater/grab_fix.h"
+ #include "Extension/Skater/camera_observer.h"
+ #include "Extension/UI/NativeMenu/native_menu.h"
+ #include "Extension/Multiplayer/Hud/native_party.h"
+@@ -1096,6 +1097,7 @@ void update_model(std::uintptr_t client, TickState& frame) {
+     dingosdk::drone::outfit::on_client_tick();
+     dingosdk::board_break::on_client_tick(client);
+     dingosdk::grind_exit_control::on_client_tick(client);
++    dingosdk::grab_fix::on_client_tick(client);
+     if (!has_request && now < r.next_model && state == r.previous_state) return;
+     r.next_model = now + 500;
+     DINGO_PROFILE_ZONE("tick/update_model/world model (500 ms)");
+@@ -1257,6 +1259,8 @@ void update_model(std::uintptr_t client, TickState& frame) {
+     model.grind_exit = {dingosdk::grind_exit_control::available(), dingosdk::grind_exit_control::enabled(),
+                         dingosdk::grind_exit_control::toe_heel(), dingosdk::grind_exit_control::stance(),
+                         dingosdk::grind_exit_control::strength()};
++    model.grab_fix = {dingosdk::grab_fix::available(), dingosdk::grab_fix::enabled(), dingosdk::grab_fix::probe_available(),
++                      dingosdk::grab_fix::probe(), dingosdk::grab_fix::legacy_footplants()};
+     model.keyframe_smoothing = {dingosdk::replay_keyframes::available(), dingosdk::replay_keyframes::on(),
+                                 dingosdk::replay_keyframes::smoothness()};
+     model.bindings = dingosdk::local_profile_controller_bindings();
+diff --git a/Runtime/runtime_init.cpp b/Runtime/runtime_init.cpp
+index 9b2e836..ba253a4 100644
+--- a/Runtime/runtime_init.cpp
++++ b/Runtime/runtime_init.cpp
+@@ -33,6 +33,7 @@
+ #include "Extension/RoadRash/road_rash.h"
+ #include "Extension/BoardBreak/board_break.h"
+ #include "Extension/Skater/grind_exit_control.h"
++#include "Extension/Skater/grab_fix.h"
+ #include "Extension/Skater/camera_observer.h"
+ #include "Extension/Progression/entitlement_request_hook.h"
+ #include "Extension/Skater/skater_observer.h"
+@@ -452,6 +453,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI DingoSDKDebugInitialize() {
+         record("{\"event\":\"board_break_initialized\",\"active\":" + std::string(board_break ? "true" : "false") + "}");
+         const bool grind_control = dingosdk::grind_exit_control::start(r.base);
+         record("{\"event\":\"grind_exit_control_initialized\",\"active\":" + std::string(grind_control ? "true" : "false") + "}");
++        const bool grab_fix = dingosdk::grab_fix::start(r.base);
++        record("{\"event\":\"grab_fix_initialized\",\"active\":" + std::string(grab_fix ? "true" : "false") + "}");
+         const bool noclip_velocity = dingosdk::start_client_noclip_velocity(r.base);
+         record("{\"event\":\"noclip_velocity_initialized\",\"active\":" + std::string(noclip_velocity ? "true" : "false") + "}");
+         const bool loading_screens = dingosdk::loading_screen::start(r.base);
+diff --git a/cmake/Runtime.cmake b/cmake/Runtime.cmake
+index e6256e6..da5dde1 100644
+--- a/cmake/Runtime.cmake
++++ b/cmake/Runtime.cmake
+@@ -153,6 +153,8 @@ add_library(dingosdk_runtime SHARED
+     Extension/Skater/no_bail.cpp
+     Extension/Skater/grind_exit_commands.cpp
+     Extension/Skater/grind_exit_control.cpp
++    Extension/Skater/grab_fix.cpp
++    Extension/Skater/grab_fix_commands.cpp
+     Extension/Skater/physics_tuning.cpp
+     Extension/Multiplayer/Remote/remote_collision.cpp
+     Extension/Skater/physics_tuning_model.cpp
