@@ -42,9 +42,13 @@ jobs:
           ref: ${{ inputs.upstream_ref }}
           path: ReSkate
 
+      # No GitHub expression (dollar sign + double braces) may appear in this step's run block: GitHub would evaluate the whole
+      # block (the embedded patch) as one expression, which is capped at 21000 characters.
       - name: Apply the Grab Fix patch
         shell: pwsh
         working-directory: ReSkate
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
         run: |
           $b64 = @'
           ZGlmZiAtLWdpdCBhL0V4dGVuc2lvbi9Db25zb2xlL2NvbW1hbmRzLmNwcCBiL0V4dGVuc2lvbi9Db25zb2xlL2NvbW1hbmRzLmNw
@@ -646,7 +650,7 @@ jobs:
           $hash = (Get-FileHash grab-fix.patch -Algorithm SHA256).Hash
           if ($hash -ne $env:PATCH_SHA256) { throw "Embedded patch is damaged: SHA-256 $hash, expected $env:PATCH_SHA256" }
           git apply --ignore-whitespace --check grab-fix.patch
-          if ($LASTEXITCODE -ne 0) { throw "The Grab Fix patch does not apply to ${{ inputs.upstream_ref }}." }
+          if ($LASTEXITCODE -ne 0) { throw "The Grab Fix patch does not apply to $env:UPSTREAM_REF." }
           git apply --ignore-whitespace grab-fix.patch
           if ($LASTEXITCODE -ne 0) { throw "git apply failed." }
           Remove-Item grab-fix.patch
